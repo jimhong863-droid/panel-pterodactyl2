@@ -1,0 +1,54 @@
+name: Free VPS (Quick Tunnel + SSH)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_tmate:
+        description: "Aktifin SSH tmate?"
+        required: true
+        default: "true"
+
+jobs:
+  vps:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Setup paralel (start svc + install cloudflared)
+        run: |
+          set -euxo pipefail
+          sudo systemctl start docker &
+          curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cf.deb
+          wait
+          docker --version
+          cloudflared --version
+
+      - name: Start Quick Tunnel & ambil URL
+        run: |
+          set -euxo pipefail
+          # Web server simple buat dipantau via tunnel (port 8000)
+          nohup python3 -m http.server 8000 > /tmp/web.log 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:8000 > /tmp/cf.log 2>&1 &
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cf.log | head -n1 || true)
+            [ -n "$TUNNEL_URL" ] && break
+            sleep 2
+          done
+          [ -z "$TUNNEL_URL" ] && { cat /tmp/cf.log; exit 1; }
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_ENV"
+          echo "=========================================="
+          echo " VPS siap dipake!"
+          echo " Tunnel URL : $TUNNEL_URL"
+          echo "=========================================="
+
+      - name: tmate SSH
+        if: ${{ github.event.inputs.enable_tmate == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
+          detached: false
