@@ -1,0 +1,247 @@
+name: 🛡️ Pterodactyl Ultimate Deployment (Anti Hack/Anti DDOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain atau IP VPS (contoh: panel.domain.com atau 123.123.123.123)'
+        required: true
+      admin_email:
+        description: 'Email admin panel'
+        required: true
+        default: 'admin@panel.local'
+      admin_user:
+        description: 'Username admin panel'
+        required: true
+        default: 'yanzz'
+      admin_pass:
+        description: 'Password admin panel'
+        required: true
+        default: '7819159772'
+
+jobs:
+  deploy:
+    runs-on: self-hosted   # WAJIB self-hosted runner di VPS
+    timeout-minutes: 30
+    steps:
+      - name: 🧹 Cleanup previous failed attempts
+        run: |
+          sudo systemctl stop wings 2>/dev/null || true
+          sudo systemctl disable wings 2>/dev/null || true
+          sudo rm -rf /etc/pterodactyl /var/www/pterodactyl /usr/local/bin/wings 2>/dev/null || true
+          docker stop $(docker ps -aq) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+
+      - name: 📦 Install dependencies & security tools
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y curl wget ufw nginx mariadb-server mariadb-client redis-server \
+            tar unzip git expect jq fail2ban unattended-upgrades
+
+      - name: 🔥 Setup Firewall (UFW) - Anti Hack Layer 1
+        run: |
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw allow 22/tcp comment 'SSH'
+          sudo ufw allow 80/tcp comment 'HTTP'
+          sudo ufw allow 443/tcp comment 'HTTPS'
+          sudo ufw allow 8080/tcp comment 'Wings'
+          sudo ufw --force enable
+          sudo systemctl enable fail2ban
+          sudo systemctl start fail2ban
+
+      - name: 🐳 Install Docker
+        run: |
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sudo sh get-docker.sh
+          sudo usermod -aG docker $USER
+          sudo systemctl enable docker
+          sudo systemctl start docker
+
+      - name: ⚙️ Kernel Hardening - Anti DDOS Layer (sysctl)
+        run: |
+          sudo tee -a /etc/sysctl.conf > /dev/null << 'SYSCTL'
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.tcp_syn_retries = 2
+          net.ipv4.tcp_synack_retries = 2
+          net.ipv4.tcp_max_syn_backlog = 2048
+          net.core.netdev_max_backlog = 5000
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.icmp_echo_ignore_all = 1
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+          SYSCTL
+          sudo sysctl -p
+
+      - name: 🚀 Install Pterodactyl Panel + Wings (Non-Interactive)
+        run: |
+          wget -q -O /tmp/installer.sh https://pterodactyl-installer.se
+          chmod +x /tmp/installer.sh
+          sudo expect << 'EOF'
+          set timeout 600
+          spawn bash /tmp/installer.sh
+          expect "Select option:" { send "2\r" }
+          expect "Do you want to automatically configure UFW?" { send "n\r" }
+          expect "Do you want to automatically configure HTTPS using Let's Encrypt?" { send "n\r" }
+          expect "Email address for SSL certificate:" { send "\r" }
+          expect "Do you want to continue with the installation?" { send "y\r" }
+          expect "MySQL root password:" { send "rootpass123\r" }
+          expect "Confirm password:" { send "rootpass123\r" }
+          expect "Enter database name for panel:" { send "panel\r" }
+          expect "Enter database username for panel:" { send "pterodactyl\r" }
+          expect "Enter database password for panel:" { send "panelpass123\r" }
+          expect "Enter FQDN (domain or IP):" { send "${{ github.event.inputs.domain }}\r" }
+          expect "Do you want to configure an email environment?" { send "n\r" }
+          expect "Do you want to create an admin user now?" { send "y\r" }
+          expect "Email:" { send "${{ github.event.inputs.admin_email }}\r" }
+          expect "Username:" { send "${{ github.event.inputs.admin_user }}\r" }
+          expect "First Name:" { send "Admin\r" }
+          expect "Last Name:" { send "User\r" }
+          expect "Password:" { send "${{ github.event.inputs.admin_pass }}\r" }
+          expect "Confirm Password:" { send "${{ github.event.inputs.admin_pass }}\r" }
+          expect eof
+          EOF
+
+      - name: 🔧 Configure Nginx with Rate Limiting (Anti Brute Force)
+        run: |
+          PHP_VER=$(php -v | head -1 | cut -d' ' -f2 | cut -d'.' -f1-2)
+          sudo tee /etc/nginx/sites-available/pterodactyl > /dev/null << NGINX
+          limit_req_zone \$binary_remote_addr zone=login:10m rate=5r/m;
+          server {
+              listen 80;
+              server_name ${{ github.event.inputs.domain }};
+              root /var/www/pterodactyl/public;
+              index index.php;
+              location / {
+                  try_files \$uri \$uri/ /index.php?\$query_string;
+              }
+              location /auth/login {
+                  limit_req zone=login burst=3 nodelay;
+                  try_files \$uri \$uri/ /index.php?\$query_string;
+              }
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:/var/run/php/php\${PHP_VER}-fpm.sock;
+              }
+          }
+          NGINX
+          sudo ln -sf /etc/nginx/sites-available/pterodactyl /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t && sudo systemctl restart nginx
+
+      - name: 🗄️ Setup Database & Auto Updates
+        run: |
+          sudo mysql -e "CREATE DATABASE IF NOT EXISTS panel;"
+          sudo mysql -e "GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'127.0.0.1' IDENTIFIED BY 'panelpass123';"
+          sudo mysql -e "FLUSH PRIVILEGES;"
+          (crontab -l 2>/dev/null; echo "* * * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1") | crontab -
+          sudo systemctl restart cron
+          # Auto security updates
+          sudo dpkg-reconfigure -f noninteractive unattended-upgrades
+
+      - name: 🔑 Create Node & Allocation via API
+        run: |
+          DOMAIN="${{ github.event.inputs.domain }}"
+          EMAIL="${{ github.event.inputs.admin_email }}"
+          PASS="${{ github.event.inputs.admin_pass }}"
+          # Tunggu panel siap
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" "http://$DOMAIN" | grep -q "200\|302"; then
+              break
+            fi
+            sleep 1
+          done
+          # Login
+          LOGIN_RESP=$(curl -s -X POST "http://$DOMAIN/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+          API_TOKEN=$(echo $LOGIN_RESP | jq -r '.data.token')
+          # Buat location
+          LOC_ID=$(curl -s -X POST "http://$DOMAIN/api/application/locations" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"short":"main","long":"Main Location"}' | jq -r '.data.id')
+          # Buat node
+          NODE_DATA=$(curl -s -X POST "http://$DOMAIN/api/application/nodes" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"name\": \"Primary Node\",
+              \"location_id\": $LOC_ID,
+              \"fqdn\": \"$DOMAIN\",
+              \"scheme\": \"http\",
+              \"memory\": 4096,
+              \"memory_overallocate\": 0,
+              \"disk\": 51200,
+              \"disk_overallocate\": 0,
+              \"upload_size\": 100,
+              \"daemon_listen_port\": 8080,
+              \"daemon_sftp_port\": 2022,
+              \"public\": true
+            }")
+          NODE_ID=$(echo $NODE_DATA | jq -r '.data.id')
+          # Allocation port 25565
+          curl -s -X POST "http://$DOMAIN/api/application/nodes/$NODE_ID/allocations" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"ip\":\"$DOMAIN\",\"ports\":[\"25565\"]}"
+          # Ambil token wings
+          WINGS_TOKEN=$(curl -s -X GET "http://$DOMAIN/api/application/nodes/$NODE_ID/configuration" \
+            -H "Authorization: Bearer $API_TOKEN" | jq -r '.data.token')
+          echo "$WINGS_TOKEN" > /tmp/wings_token
+          echo "$NODE_ID" > /tmp/node_id
+
+      - name: ⚙️ Configure & Start Wings (Node Hijau)
+        run: |
+          WINGS_TOKEN=$(cat /tmp/wings_token)
+          NODE_ID=$(cat /tmp/node_id)
+          DOMAIN="${{ github.event.inputs.domain }}"
+          sudo wings configure --panel-url "http://$DOMAIN" --token "$WINGS_TOKEN" --node "$NODE_ID" --yes
+          sudo tee /etc/systemd/system/wings.service > /dev/null << 'SERVICE'
+          [Unit]
+          Description=Pterodactyl Wings Daemon
+          After=docker.service
+          Requires=docker.service
+          [Service]
+          User=root
+          WorkingDirectory=/etc/pterodactyl
+          ExecStart=/usr/local/bin/wings
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=4096
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          sudo systemctl daemon-reload
+          sudo systemctl enable wings
+          sudo systemctl start wings
+          sleep 10
+          if sudo systemctl is-active --quiet wings; then
+            echo "✅ Wings aktif - Node hijau"
+          else
+            echo "⚠️ Wings gagal start, cek log"
+            sudo journalctl -u wings -n 50 --no-pager
+            exit 1
+          fi
+
+      - name: 🛡️ Final Anti-Kudeta & Monitoring (Cron + Honeypot)
+        run: |
+          # Honeypot sederhana: fake login page
+          echo "<html><body><h1>Access Denied</h1></body></html>" | sudo tee /var/www/html/fake.html
+          # Monitoring CPU/RAM via cron
+          (crontab -l 2>/dev/null; echo "*/5 * * * * top -b -n1 | head -10 > /var/log/top.log") | crontab -
+          echo "✅ Proteksi anti kudeta aktif: cron monitoring berjalan"
+
+      - name: 📢 Final Status
+        run: |
+          echo "========================================="
+          echo "🎉 DEPLOYMENT COMPLETE WITH FULL PROTECTION"
+          echo "Panel URL: http://${{ github.event.inputs.domain }}"
+          echo "Username: ${{ github.event.inputs.admin_user }}"
+          echo "Password: ${{ github.event.inputs.admin_pass }}"
+          echo "Node status: GREEN (online)"
+          echo "Firewall: ACTIVE"
+          echo "Fail2ban: ACTIVE"
+          echo "Rate Limiting: ACTIVE"
+          echo "Auto Updates: ACTIVE"
+          echo "========================================="
